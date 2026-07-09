@@ -5,11 +5,16 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::Parser;
-use colored::*;
-use rayon::prelude::*;
+
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+const RESET: &str = "\x1b[0m";
 
 #[derive(Parser)]
 #[command(name = "ncmpp", about = "A fast multi-threaded NCM decrypter")]
@@ -34,11 +39,6 @@ fn main() {
 
     println!("Start with {} threads.\n", threads);
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build_global()
-        .expect("Failed to build thread pool");
-
     if !Path::new("unlock").exists() {
         fs::create_dir("unlock").expect("Failed to create unlock directory");
     }
@@ -50,42 +50,69 @@ fn main() {
 
     let start = Instant::now();
     let total = AtomicUsize::new(0);
+    let unlocked_files = Arc::new(unlocked_files);
+    let log_mtx = Arc::new(Mutex::new(()));
 
     let ncm_files: Vec<_> = match read_dir_ncm("./") {
         Ok(files) => files,
         Err(e) => {
-            eprintln!("{} Failed to read current directory: {}", "Error:".red(), e);
+            eprintln!("{RED}Error: Failed to read current directory: {e}{RESET}");
             return;
         }
     };
 
-    ncm_files.par_iter().for_each(|path| {
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    let files_iter = Arc::new(Mutex::new(ncm_files.into_iter()));
 
-        if unlocked_files.contains(&stem) {
-            println!("{}", format!("Skipped:\t{}", filename).yellow());
-        } else {
-            match ncm::ncm_dump(path, "unlock") {
-                Ok(()) => {
-                    println!("{}", format!("Unlocked:\t{}", filename).cyan());
-                    total.fetch_add(1, Ordering::Relaxed);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let files_iter = Arc::clone(&files_iter);
+            let unlocked_files = Arc::clone(&unlocked_files);
+            let log_mtx = Arc::clone(&log_mtx);
+            let total = &total;
+            s.spawn(move || {
+                loop {
+                    let path = {
+                        let mut iter = files_iter.lock().unwrap();
+                        iter.next()
+                    };
+                    let path = match path {
+                        Some(p) => p,
+                        None => break,
+                    };
+
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let filename = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+
+                    if unlocked_files.contains(&stem) {
+                        let _lock = log_mtx.lock().unwrap();
+                        println!("{YELLOW}Skipped:\t{filename}{RESET}");
+                        continue;
+                    }
+
+                    match ncm::ncm_dump(&path, "unlock") {
+                        Ok(()) => {
+                            let _lock = log_mtx.lock().unwrap();
+                            println!("{CYAN}Unlocked:\t{filename}{RESET}");
+                            total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let _lock = log_mtx.lock().unwrap();
+                            eprintln!("{RED}Failed:\t{filename} ({e}){RESET}");
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("{}", format!("Failed:\t{} ({})", filename, e).red());
-                }
-            }
+            });
         }
     });
 
     let elapsed = start.elapsed();
-    println!("\n{}", "Finished.".green());
+    println!("\n{GREEN}Finished.{RESET}");
     println!(
         "Unlocked {} pieces of music.",
         total.load(Ordering::Relaxed)
